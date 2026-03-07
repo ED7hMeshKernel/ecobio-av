@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -52,9 +53,9 @@ def load_rules():
 def scan_file(rules, filepath):
     """Scan a single file against YARA rules."""
     try:
-        matches = rules.match(filepath, timeout=10)
+        matches = rules.match(filepath, timeout=15)
         return matches
-    except yara.Error as e:
+    except yara.Error:
         return []
 
 
@@ -71,15 +72,21 @@ def file_hash(filepath):
 
 
 def quarantine(filepath):
-    """Move file to quarantine directory."""
+    """Move file to quarantine directory (cross-device safe)."""
     QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
     dest = QUARANTINE_DIR / f"{filepath.name}.{int(time.time())}.quarantined"
     try:
-        filepath.rename(dest)
-        print(f"  [Q] Quarantined: {filepath} -> {dest}")
+        # Use copy+delete instead of rename for cross-device support (WSL→Windows)
+        shutil.copy2(str(filepath), str(dest))
+        filepath.unlink()
+        print(f"  [Q] Quarantined: {filepath.name} -> {dest}")
         return True
     except (OSError, PermissionError) as e:
-        print(f"  [!] Cannot quarantine {filepath}: {e}")
+        # If delete fails (permissions), at least log it
+        if dest.exists():
+            print(f"  [Q] Copied to quarantine (original kept — no delete permission)")
+            return True
+        print(f"  [!] Cannot quarantine {filepath.name}: {e}")
         return False
 
 
@@ -104,7 +111,7 @@ def log_detection(filepath, matches):
         f.write(json.dumps(entry) + "\n")
 
 
-def scan_directory(rules, directory, recursive=True):
+def scan_directory(rules, directory, recursive=True, do_quarantine=True):
     """Scan all files in a directory."""
     directory = Path(directory)
     if not directory.is_dir():
@@ -113,9 +120,10 @@ def scan_directory(rules, directory, recursive=True):
 
     total = 0
     detections = 0
+    clean = 0
     pattern = "**/*" if recursive else "*"
 
-    for filepath in directory.glob(pattern):
+    for filepath in sorted(directory.glob(pattern)):
         if not filepath.is_file():
             continue
         if filepath.suffix.lower() not in SCAN_EXTENSIONS:
@@ -129,22 +137,32 @@ def scan_directory(rules, directory, recursive=True):
                 (m.meta.get("threat_level", "unknown") for m in matches),
                 key=lambda x: {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(x, 0),
             )
-            print(f"\n  [DETECTION] {filepath}")
-            print(f"  Threat: {threat_level}")
+            print(f"\n  [{'!!' if threat_level == 'critical' else '!'}] {filepath.name}")
+            print(f"      Path: {filepath}")
+            print(f"      Threat: {threat_level.upper()}")
+            print(f"      SHA256: {file_hash(str(filepath))[:32]}...")
             for m in matches:
-                print(f"    Rule: {m.rule}")
-                print(f"    MITRE: {m.meta.get('mitre', 'N/A')}")
-                print(f"    Action: {m.meta.get('action', 'ALERT')}")
+                print(f"      Rule: {m.rule}")
+                print(f"        MITRE: {m.meta.get('mitre', 'N/A')}")
+                print(f"        Action: {m.meta.get('action', 'ALERT')}")
             log_detection(filepath, matches)
 
             # Auto-quarantine critical threats
-            if threat_level == "critical":
+            if threat_level == "critical" and do_quarantine:
                 quarantine(filepath)
         else:
+            clean += 1
             sys.stdout.write(".")
             sys.stdout.flush()
 
-    print(f"\n\n[=] Scan complete: {total} files scanned, {detections} detections")
+    print(f"\n\n{'=' * 50}")
+    print(f"  Scan complete")
+    print(f"  Files scanned: {total}")
+    print(f"  Clean: {clean}")
+    print(f"  Detections: {detections}")
+    if detections:
+        print(f"  Log: {LOG_FILE}")
+    print(f"{'=' * 50}")
     return detections
 
 
@@ -164,14 +182,23 @@ def watch_directory(rules, directory, interval=2):
                 if filepath.suffix.lower() not in SCAN_EXTENSIONS:
                     continue
 
-                mtime = filepath.stat().st_mtime
+                try:
+                    mtime = filepath.stat().st_mtime
+                except OSError:
+                    continue
+
                 if filepath not in seen or seen[filepath] != mtime:
                     seen[filepath] = mtime
                     matches = scan_file(rules, str(filepath))
                     if matches:
-                        print(f"\n  [ALERT] {filepath.name}")
+                        threat_level = max(
+                            (m.meta.get("threat_level", "unknown") for m in matches),
+                            key=lambda x: {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(x, 0),
+                        )
+                        ts = time.strftime("%H:%M:%S")
+                        print(f"\n  [{ts}] [ALERT] {filepath.name} — {threat_level.upper()}")
                         for m in matches:
-                            print(f"    Rule: {m.rule} | {m.meta.get('threat_level', '?')} | {m.meta.get('mitre', '')}")
+                            print(f"    {m.rule} | {m.meta.get('mitre', '')}")
                         log_detection(filepath, matches)
 
             time.sleep(interval)
@@ -188,6 +215,7 @@ def main():
     parser.add_argument("--watch", "-w", metavar="DIR", help="Watch directory for new files")
     parser.add_argument("--recursive", "-r", action="store_true", default=True)
     parser.add_argument("--rules", metavar="DIR", help="Custom rules directory")
+    parser.add_argument("--no-quarantine", action="store_true", help="Disable auto-quarantine")
     args = parser.parse_args()
 
     global RULES_DIR
@@ -195,13 +223,15 @@ def main():
         RULES_DIR = Path(args.rules)
 
     print("=" * 50)
-    print("  ECOBIO Antivirus Scanner")
+    print("  ECOBIO Antivirus Scanner v0.1")
     print("=" * 50)
     print()
 
     rules = load_rules()
     if not rules:
         sys.exit(1)
+
+    print()
 
     if args.watch:
         watch_directory(rules, args.watch)
@@ -217,7 +247,7 @@ def main():
             else:
                 print(f"  [CLEAN] {target}")
         elif target.is_dir():
-            scan_directory(rules, target, args.recursive)
+            scan_directory(rules, target, args.recursive, not args.no_quarantine)
         else:
             print(f"[!] Path not found: {target}")
             sys.exit(1)
